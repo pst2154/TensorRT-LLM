@@ -289,6 +289,7 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
+        "compressed-tensors": ["compressed-tensors>=0.8.0"],
     },
     zip_safe=True,
     install_requires=required_deps,

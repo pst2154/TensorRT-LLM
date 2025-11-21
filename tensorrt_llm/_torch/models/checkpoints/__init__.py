@@ -1,4 +1,7 @@
 from .base_checkpoint_loader import BaseCheckpointLoader
+from .compressed_tensors.config_loader import CompressedTensorsConfigLoader
+from .compressed_tensors.weight_loader import CompressedTensorsWeightLoader
+from .compressed_tensors.weight_mapper import CompressedTensorsWeightMapper
 from .hf.checkpoint_loader import HfCheckpointLoader
 from .hf.config_loader import HfConfigLoader
 from .hf.gemma3_weight_mapper import Gemma3HfWeightMapper
@@ -18,5 +21,7 @@ __all__ = [
     "BaseCheckpointLoader", "HfCheckpointLoader", "NemotronHHfWeightMapper",
     "Gemma3HfWeightMapper", "MixtralHfWeightMapper", "Llama4HfWeightMapper",
     "Qwen2MoeHfWeightMapper", "Qwen3MoeHfWeightMapper", "Qwen2VLHfWeightMapper",
-    "Qwen3NextHfWeightMapper", "LlavaNextHfWeightMapper"
+    "Qwen3NextHfWeightMapper", "LlavaNextHfWeightMapper",
+    "CompressedTensorsConfigLoader", "CompressedTensorsWeightLoader",
+    "CompressedTensorsWeightMapper"
 ]
