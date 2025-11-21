@@ -200,12 +200,143 @@ class HFQuantConfigReader(QuantConfigReader):
         return model
 
 
+@QuantConfigReaderRegistry.register("compressed_tensors")
+class CompressedTensorsConfigReader(QuantConfigReader):
+    """
+    Reader for compressed-tensors format (neuralmagic).
+    Handles GPTQ, AWQ, SparseGPT and other compressed formats.
+    """
+
+    def read_config(self, config: Dict) -> Dict:
+        """Parse compressed-tensors quantization config."""
+        qconf = config.get("quantization_config")
+        if not qconf:
+            raise ValueError("compressed-tensors quantization_config not found.")
+
+        quant_method = qconf.get("quant_method", "").lower()
+        if quant_method != "compressed-tensors":
+            raise ValueError(f"Expected quant_method 'compressed-tensors', got '{quant_method}'")
+
+        # Get format type (int-quantized, float-quantized, pack-quantized, etc.)
+        format_type = qconf.get("format")
+        
+        # Parse config groups to determine quantization parameters
+        config_groups = qconf.get("config_groups", {})
+        
+        # Map compressed-tensors format to TRT-LLM QuantAlgo
+        if format_type == "int-quantized":
+            self._quant_config = self._map_int_quantized(qconf, config_groups)
+        elif format_type == "float-quantized":
+            self._quant_config = self._map_float_quantized(qconf, config_groups)
+        elif format_type == "pack-quantized":
+            self._quant_config = self._map_pack_quantized(qconf, config_groups)
+        elif format_type == "dense-sparsity":
+            self._quant_config = self._map_sparse_format(qconf, config_groups)
+        else:
+            raise ValueError(f"Unsupported compressed-tensors format: {format_type}")
+
+        extra_model_kwargs: Dict[str, Any] = {}
+        return extra_model_kwargs
+
+    def _map_int_quantized(self, qconf: Dict, config_groups: Dict) -> Dict:
+        """Map INT quantization (GPTQ, AWQ) to TRT-LLM format."""
+        # Get quantization parameters from first config group
+        group_config = config_groups.get("group_0", {})
+        num_bits = group_config.get("num_bits", 4)
+        group_size = group_config.get("group_size", 128)
+        strategy = qconf.get("quantization_strategy", "").lower()
+        
+        # Determine if this is AWQ or GPTQ based on strategy or targets
+        targets = set(group_config.get("targets", []))
+        is_weight_only = "weight" in targets and "input" not in targets
+        
+        quant_config = {
+            "format": "int-quantized",
+            "num_bits": num_bits,
+            "group_size": group_size,
+        }
+        
+        if is_weight_only:
+            if num_bits == 4:
+                # Check if AWQ or GPTQ based on additional metadata
+                if "awq" in strategy or qconf.get("ignore", [""])[0].find("lm_head") >= 0:
+                    quant_config["quant_algo"] = "W4A16_AWQ"
+                else:
+                    quant_config["quant_algo"] = "W4A16_GPTQ"
+            elif num_bits == 8:
+                quant_config["quant_algo"] = "W8A16"
+            else:
+                quant_config["quant_algo"] = f"W{num_bits}A16"
+        
+        return quant_config
+
+    def _map_float_quantized(self, qconf: Dict, config_groups: Dict) -> Dict:
+        """Map FP8 quantization to TRT-LLM format."""
+        return {
+            "format": "float-quantized",
+            "quant_algo": "FP8",
+        }
+
+    def _map_pack_quantized(self, qconf: Dict, config_groups: Dict) -> Dict:
+        """Map packed/marlin formats."""
+        group_config = config_groups.get("group_0", {})
+        num_bits = group_config.get("num_bits", 4)
+        
+        return {
+            "format": "pack-quantized",
+            "quant_algo": f"W{num_bits}A16",
+            "packed": True,
+        }
+
+    def _map_sparse_format(self, qconf: Dict, config_groups: Dict) -> Dict:
+        """Map sparse/pruned formats."""
+        return {
+            "format": "dense-sparsity",
+            "sparsity": True,
+        }
+
+    @classmethod
+    def from_file(cls, ckpt_dir: str) -> Optional[Tuple["CompressedTensorsConfigReader", Dict[str, Any]]]:
+        """Load compressed-tensors config from checkpoint."""
+        config_file = os.path.join(ckpt_dir, "config.json")
+        if not os.path.exists(config_file):
+            return None
+
+        with open(config_file, "r") as f:
+            raw = json.load(f)
+
+        qconf = raw.get("quantization_config")
+        if not isinstance(qconf, dict):
+            return None
+
+        # Check if this is a compressed-tensors format
+        quant_method = str(qconf.get("quant_method", "")).lower()
+        if quant_method != "compressed-tensors":
+            return None
+
+        reader = cls()
+        try:
+            extra_model_kwargs = reader.read_config(raw)
+            return reader, extra_model_kwargs
+        except Exception as e:
+            # If parsing fails, return None to allow fallback to other readers
+            return None
+
+
 def autodetect_quant_config_reader(
     fetched_dir: str,
 ) -> Optional[Tuple["QuantConfigReader", Dict[str, Any]]]:
-    """Try ModelOPT first; if not found, fall back to HF. Returns (reader, extra_kwargs) or None."""
+    """Try compressed-tensors, then ModelOPT, then HF. Returns (reader, extra_kwargs) or None."""
+    # Try compressed-tensors first
+    ct_cls = QuantConfigReaderRegistry.get("compressed_tensors")
+    result = ct_cls.from_file(fetched_dir)
+    if result is not None:
+        return result
+    
+    # Try ModelOPT
     reader_cls = QuantConfigReaderRegistry.get("modelopt")
     result = reader_cls.from_file(fetched_dir)
+    
     # Fallback to HF reader if ModelOPT not present
     if result is None:
         hf_cls = QuantConfigReaderRegistry.get("hf")
