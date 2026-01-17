@@ -425,6 +425,42 @@ class ModelLoader:
                         'block.*.attn.out', 'block.*.mlp.gate',
                         'block.*.attn.qkv', 'embedding', 'unembedding'
                     ]
+                elif hf_quant_config.get("quant_method") == "compressed-tensors":
+                    # Compressed-tensors format (NeuralMagic)
+                    format_type = hf_quant_config.get("format")
+                    config_groups = hf_quant_config.get("config_groups", {})
+                    
+                    if format_type == "float-quantized":
+                        # FP8 quantization
+                        quant_config.quant_algo = QuantAlgo.FP8
+                        # Get exclude list from ignore field
+                        ignore_modules = hf_quant_config.get("ignore", [])
+                        if ignore_modules:
+                            quant_config.exclude_modules = ignore_modules
+                    elif format_type == "int-quantized":
+                        # INT4/INT8 quantization (GPTQ, AWQ)
+                        group_config = list(config_groups.values())[0] if config_groups else {}
+                        weights_config = group_config.get("weights", {})
+                        num_bits = weights_config.get("num_bits", 4)
+                        group_size = weights_config.get("group_size", 128)
+                        
+                        if num_bits == 4:
+                            # Use W4A16 for now, specific algo detection would need more info
+                            quant_config.quant_algo = QuantAlgo.W4A16
+                            quant_config.group_size = group_size
+                        elif num_bits == 8:
+                            quant_config.quant_algo = QuantAlgo.W8A16
+                        else:
+                            raise ValueError(f"Unsupported num_bits={num_bits} for compressed-tensors")
+                        
+                        # Get exclude list from ignore field
+                        ignore_modules = hf_quant_config.get("ignore", [])
+                        if ignore_modules:
+                            quant_config.exclude_modules = ignore_modules
+                    else:
+                        raise ValueError(f"Unsupported compressed-tensors format: {format_type}")
+                    
+                    logger.info(f"Loaded compressed-tensors config: format={format_type}, quant_algo={quant_config.quant_algo}")
                 else:
                     raise NotImplementedError(
                         f"Unsupported quantization_config: {hf_quant_config}.")
