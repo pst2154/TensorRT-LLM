@@ -15,6 +15,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, Diffusio
 from tensorrt_llm._torch.visual_gen.models.qwen_image import (
     QwenImagePipeline,
     QwenImageTransformer2DModel,
+    QwenImageTransformerBlock,
     QwenJointAttention,
     apply_rotary_emb_qwen,
 )
@@ -465,3 +466,25 @@ def test_qwen_transformer_cpu_fallback_uses_unfused_qk_norm_rope():
     )
 
     assert out[0].shape == hidden_states.shape
+
+
+def test_qwen_transformer_block_modulation_helpers():
+    x = torch.tensor([[[1.0, -2.0], [3.0, -4.0]]])
+    mod_params = torch.tensor([[0.5, -1.0, 2.0, -0.5, 0.25, 0.75]])
+
+    modulated, gate = QwenImageTransformerBlock._modulate(x, mod_params)
+
+    expected_modulated = x * torch.tensor([[[3.0, 0.5]]]) + torch.tensor([[[0.5, -1.0]]])
+    expected_gate = torch.tensor([[[0.25, 0.75]]])
+    torch.testing.assert_close(modulated, expected_modulated)
+    torch.testing.assert_close(gate, expected_gate)
+
+
+def test_qwen_transformer_block_gate_residual_helper():
+    hidden_states = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    gate = torch.tensor([[[0.25, 0.5]]])
+    residual = torch.tensor([[[8.0, 6.0], [4.0, 2.0]]])
+
+    output = QwenImageTransformerBlock._apply_gate_residual(hidden_states, gate, residual)
+
+    torch.testing.assert_close(output, hidden_states + gate * residual)
