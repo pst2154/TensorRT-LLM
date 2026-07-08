@@ -28,6 +28,7 @@ from torch import nn
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -224,6 +225,7 @@ class AdaLayerNormContinuous(nn.Module):
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
 
+    @maybe_compile()
     def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
         emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
         scale, shift = torch.chunk(emb, 2, dim=1)
@@ -699,12 +701,22 @@ class QwenImageTransformerBlock(nn.Module):
         )
 
     @staticmethod
+    @maybe_compile()
     def _modulate(x: torch.Tensor, mod_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         shift = shift.unsqueeze(1)
         scale = scale.unsqueeze(1)
         gate = gate.unsqueeze(1)
         return x * (1 + scale) + shift, gate
+
+    @staticmethod
+    @maybe_compile()
+    def _apply_gate_residual(
+        hidden_states: torch.Tensor,
+        gate: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden_states + gate * residual
 
     def forward(
         self,
@@ -735,15 +747,21 @@ class QwenImageTransformerBlock(nn.Module):
         )
 
         # Residual.
-        hidden_states = hidden_states + img_gate1 * img_attn_output
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+        hidden_states = self._apply_gate_residual(hidden_states, img_gate1, img_attn_output)
+        encoder_hidden_states = self._apply_gate_residual(
+            encoder_hidden_states, txt_gate1, txt_attn_output
+        )
 
         # Norm2 + MLP + residual.
         img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), img_mod2)
-        hidden_states = hidden_states + img_gate2 * self.img_mlp(img_modulated2)
+        hidden_states = self._apply_gate_residual(
+            hidden_states, img_gate2, self.img_mlp(img_modulated2)
+        )
 
         txt_modulated2, txt_gate2 = self._modulate(self.txt_norm2(encoder_hidden_states), txt_mod2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * self.txt_mlp(txt_modulated2)
+        encoder_hidden_states = self._apply_gate_residual(
+            encoder_hidden_states, txt_gate2, self.txt_mlp(txt_modulated2)
+        )
 
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
