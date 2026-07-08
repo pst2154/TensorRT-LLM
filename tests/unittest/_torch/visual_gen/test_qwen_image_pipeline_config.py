@@ -8,6 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
+
+from tensorrt_llm._torch.utils import gelu_tanh
 
 # Importing the models package applies the Qwen-Image registration side effect.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
@@ -21,6 +24,7 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image import (
 )
 from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
     _build_joint_attention_mask,
+    _get_feedforward_activation,
     _supports_qwen_key_padding_mask,
     qwen_complex_freqs_to_cos_sin,
 )
@@ -238,7 +242,6 @@ def test_qwen_joint_attention_keeps_separate_qkv_path_unwrapped(visual_gen_mappi
 
     assert attention.qkv_mode == QKVMode.SEPARATE_QKV
     assert attention.attn.__class__.__name__ != not_wrapped_as
-
 
 class _FakeTokenBatch:
     def __init__(self, attention_mask):
@@ -488,3 +491,11 @@ def test_qwen_transformer_block_gate_residual_helper():
     output = QwenImageTransformerBlock._apply_gate_residual(hidden_states, gate, residual)
 
     torch.testing.assert_close(output, hidden_states + gate * residual)
+
+
+def test_qwen_feedforward_uses_shared_gelu_tanh():
+    assert _get_feedforward_activation("gelu-approximate") is gelu_tanh
+    assert _get_feedforward_activation("gelu") is F.gelu
+
+    with pytest.raises(ValueError, match="Unsupported activation_fn=relu"):
+        _get_feedforward_activation("relu")
