@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import math
+from collections.abc import Callable
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -28,6 +29,7 @@ from torch import nn
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.utils import gelu_tanh
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -236,9 +238,15 @@ class AdaLayerNormContinuous(nn.Module):
 # ===========================================================================
 
 
-@torch.compiler.disable
-def _gelu_tanh_eager(x: torch.Tensor) -> torch.Tensor:
-    return F.gelu(x, approximate="tanh")
+def _get_feedforward_activation(activation_fn: str) -> Callable[[torch.Tensor], torch.Tensor]:
+    if activation_fn == "gelu-approximate":
+        return gelu_tanh
+    if activation_fn == "gelu":
+        return F.gelu
+    raise ValueError(
+        f"Unsupported activation_fn={activation_fn} in Qwen-Image "
+        "FeedForward; only gelu / gelu-approximate needed."
+    )
 
 
 class FeedForward(MLP):
@@ -257,15 +265,7 @@ class FeedForward(MLP):
     ):
         inner_dim = int(dim * mult)
         dim_out = dim_out if dim_out is not None else dim
-        if activation_fn == "gelu-approximate":
-            activation = _gelu_tanh_eager
-        elif activation_fn == "gelu":
-            activation = F.gelu
-        else:
-            raise ValueError(
-                f"Unsupported activation_fn={activation_fn} in Qwen-Image "
-                "FeedForward; only gelu / gelu-approximate needed."
-            )
+        activation = _get_feedforward_activation(activation_fn)
         if dim_out != dim:
             raise ValueError("TRT-LLM MLP FeedForward requires dim_out == dim")
         super().__init__(
