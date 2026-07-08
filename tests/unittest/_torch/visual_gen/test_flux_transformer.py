@@ -64,6 +64,83 @@ def reduce_flux_config(mem_for_full_model: int, config_dict: dict):
         config_dict["num_single_layers"] = min(num_single_layers, 4)
 
 
+def _make_fake_flux2_parallel_attn():
+    from tensorrt_llm._torch.visual_gen.models.flux.attention import Flux2ParallelSelfAttention
+
+    attn = Flux2ParallelSelfAttention.__new__(Flux2ParallelSelfAttention)
+    gate_up_proj = SimpleNamespace(
+        _weights_created=True,
+        has_nvfp4=True,
+        has_bias=False,
+        out_features=256,
+    )
+    down_proj = SimpleNamespace(
+        _weights_created=True,
+        has_nvfp4=True,
+        in_features=128,
+        input_scale=torch.ones(1),
+        pre_quant_scale=None,
+        force_dynamic_quantization=False,
+    )
+    attn.to_qkv_mlp_proj = SimpleNamespace(
+        tp_size=2,
+        qkv_proj=object(),
+        mlp_proj=gate_up_proj,
+    )
+    attn.to_out = SimpleNamespace(mlp_proj=down_proj)
+    return attn, gate_up_proj, down_proj
+
+
+def test_flux2_single_stream_fp4out_guard_requires_compatible_packed_width(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.models.flux import attention as flux_attention
+
+    monkeypatch.setattr(flux_attention.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(flux_attention, "is_sm_100f", lambda: True)
+    attn, gate_up_proj, down_proj = _make_fake_flux2_parallel_attn()
+
+    hidden_states = torch.empty(1, 128, 16)
+    assert attn._can_project_hidden_mlp_with_fp4out(hidden_states)
+
+    down_proj.in_features = 64
+    assert not attn._can_project_hidden_mlp_with_fp4out(hidden_states)
+
+    gate_up_proj.out_features = 258
+    down_proj.in_features = 129
+    assert not attn._can_project_hidden_mlp_with_fp4out(hidden_states)
+
+
+def test_flux2_single_stream_fp4out_guard_requires_static_nvfp4(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.models.flux import attention as flux_attention
+
+    monkeypatch.setattr(flux_attention.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(flux_attention, "is_sm_100f", lambda: True)
+    attn, gate_up_proj, down_proj = _make_fake_flux2_parallel_attn()
+    hidden_states = torch.empty(1, 128, 16)
+
+    gate_up_proj.has_nvfp4 = False
+    assert not attn._can_project_hidden_mlp_with_fp4out(hidden_states)
+
+    gate_up_proj.has_nvfp4 = True
+    down_proj.force_dynamic_quantization = True
+    assert not attn._can_project_hidden_mlp_with_fp4out(hidden_states)
+
+    down_proj.force_dynamic_quantization = False
+    down_proj.input_scale = None
+    assert not attn._can_project_hidden_mlp_with_fp4out(hidden_states)
+
+
+def test_flux2_mlp_fp4_guard_requires_blackwell(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.models.flux import attention as flux_attention
+
+    monkeypatch.setattr(flux_attention.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(flux_attention, "is_sm_100f", lambda: True)
+    attn, _, _ = _make_fake_flux2_parallel_attn()
+    assert attn._can_project_mlp_out_from_fp4()
+
+    monkeypatch.setattr(flux_attention, "is_sm_100f", lambda: False)
+    assert not attn._can_project_mlp_out_from_fp4()
+
+
 class TestFluxTransformer(unittest.TestCase):
     """Unit tests for FLUX transformer models."""
 
@@ -126,6 +203,24 @@ class TestFluxTransformer(unittest.TestCase):
         self.assertTrue(hasattr(model, "single_transformer_blocks"))
         self.assertEqual(len(model.transformer_blocks), 1)
         self.assertEqual(len(model.single_transformer_blocks), 1)
+
+    def test_flux2_dual_stream_ffn_enables_cutedsl_blockscaling(self):
+        """FLUX.2 dual-stream FFNs should reach the fused NVFP4 SwiGLU path."""
+        from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2 import (
+            Flux2TransformerBlock,
+        )
+
+        model_config = self._create_model_config(FLUX2_CONFIG)
+        block = Flux2TransformerBlock(
+            dim=16,
+            num_attention_heads=2,
+            attention_head_dim=8,
+            mlp_ratio=2.0,
+            config=model_config,
+        )
+
+        self.assertTrue(block.ff.use_cute_dsl_blockscaling_mm)
+        self.assertTrue(block.ff_context.use_cute_dsl_blockscaling_mm)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_flux1_forward_sanity(self):

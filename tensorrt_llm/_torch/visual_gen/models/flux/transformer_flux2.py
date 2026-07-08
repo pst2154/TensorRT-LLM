@@ -256,6 +256,7 @@ class Flux2TransformerBlock(nn.Module):
             config=config,
             layer_idx=layer_idx,
             reduce_output=(tp_size != 1),
+            use_cute_dsl_blockscaling_mm=True,
         )
         # FFN for text stream
         self.ff_context = GatedMLP(
@@ -266,6 +267,7 @@ class Flux2TransformerBlock(nn.Module):
             config=config,
             layer_idx=layer_idx,
             reduce_output=(tp_size != 1),
+            use_cute_dsl_blockscaling_mm=True,
         )
 
     def forward(

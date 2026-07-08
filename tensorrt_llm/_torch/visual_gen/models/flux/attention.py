@@ -21,12 +21,14 @@ from tensorrt_llm._torch.modules.linear import (
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.swiglu import swiglu
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
     FluxJointAttnMLPProj,
     FluxJointQKVMLPProj,
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
+from tensorrt_llm._utils import is_sm_100f
 
 # =============================================================================
 # Joint Attention (shared by FLUX.1 and FLUX.2 dual-stream blocks)
@@ -306,6 +308,8 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
     - FLUX.2: Fused QKV+MLP projection for efficiency
     """
 
+    _SWIGLU_FP4_TILE_SIZE = 128
+
     def __init__(
         self,
         hidden_size: int,
@@ -417,6 +421,121 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             return self._apply_norm_rope_fused(qkv, image_rotary_emb)
         return self._apply_norm_rope_unfused(qkv, image_rotary_emb)
 
+    def _can_project_mlp_out_from_fp4(self) -> bool:
+        if self.to_qkv_mlp_proj.tp_size <= 1 or not hasattr(self.to_out, "mlp_proj"):
+            return False
+        if not torch.cuda.is_available() or not is_sm_100f():
+            return False
+
+        mlp_proj = self.to_out.mlp_proj
+        if not getattr(mlp_proj, "_weights_created", False):
+            return False
+
+        return (
+            mlp_proj.has_nvfp4
+            and mlp_proj.input_scale is not None
+            and mlp_proj.pre_quant_scale is None
+            and not mlp_proj.force_dynamic_quantization
+        )
+
+    def _can_project_hidden_mlp_with_fp4out(self, hidden_states: torch.Tensor) -> bool:
+        if (
+            self.to_qkv_mlp_proj.tp_size <= 1
+            or not hasattr(self.to_qkv_mlp_proj, "qkv_proj")
+            or not hasattr(self.to_qkv_mlp_proj, "mlp_proj")
+            or not hasattr(self.to_out, "mlp_proj")
+        ):
+            return False
+        if not torch.cuda.is_available() or not is_sm_100f():
+            return False
+
+        gate_up_proj = self.to_qkv_mlp_proj.mlp_proj
+        down_proj = self.to_out.mlp_proj
+        if not getattr(gate_up_proj, "_weights_created", False) or not getattr(
+            down_proj, "_weights_created", False
+        ):
+            return False
+
+        if not torch.compiler.is_compiling():
+            num_tokens = hidden_states.reshape(-1, hidden_states.shape[-1]).shape[0]
+            if num_tokens < Flux2ParallelSelfAttention._SWIGLU_FP4_TILE_SIZE:
+                return False
+
+        return (
+            gate_up_proj.has_nvfp4
+            and not gate_up_proj.has_bias
+            and down_proj.has_nvfp4
+            and gate_up_proj.out_features % 4 == 0
+            and down_proj.in_features % 2 == 0
+            and gate_up_proj.out_features // 4 == down_proj.in_features // 2
+            and down_proj.input_scale is not None
+            and down_proj.pre_quant_scale is None
+            and not down_proj.force_dynamic_quantization
+        )
+
+    def _project_hidden_mlp_with_fp4out(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate_up_proj = self.to_qkv_mlp_proj.mlp_proj
+        down_proj = self.to_out.mlp_proj
+
+        original_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        act_fp4, act_sf, alpha = gate_up_proj.quant_method._input_prepare(
+            gate_up_proj, hidden_states
+        )
+        mlp_fp4, mlp_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell(
+            act_fp4,
+            gate_up_proj.weight,
+            act_sf,
+            gate_up_proj.weight_scale,
+            alpha,
+            down_proj.input_scale,
+        )
+        mlp_fp4 = mlp_fp4.reshape(*original_shape[:-1], mlp_fp4.shape[-1])
+        return down_proj(Fp4QuantizedTensor(mlp_fp4, mlp_sf))
+
+    def _combine_split_projection(
+        self,
+        attn_out: torch.Tensor,
+        mlp_projected: torch.Tensor,
+    ) -> torch.Tensor:
+        out = self.to_out.allreduce(self.to_out.attn_proj(attn_out) + mlp_projected)
+        if self.to_out.has_bias:
+            out = out + self.to_out.bias
+        return out
+
+    def _project_split_output_with_fp4_mlp(
+        self,
+        attn_out: torch.Tensor,
+        mlp_hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        shape = mlp_hidden.shape
+        mlp_hidden = mlp_hidden.reshape(-1, shape[-1])
+        tile_size = Flux2ParallelSelfAttention._SWIGLU_FP4_TILE_SIZE
+        num_tokens = mlp_hidden.shape[0]
+        num_tiles = (num_tokens + tile_size - 1) // tile_size
+        padded_tokens = num_tiles * tile_size
+        if padded_tokens != num_tokens:
+            mlp_hidden = F.pad(mlp_hidden, (0, 0, 0, padded_tokens - num_tokens))
+
+        tile_idx_to_mn_limit = (
+            torch.arange(1, num_tiles + 1, dtype=torch.int32, device=mlp_hidden.device) * tile_size
+        )
+        num_non_exiting_tiles = torch.tensor(
+            [num_tiles], dtype=torch.int32, device=mlp_hidden.device
+        )
+        mlp_fp4, mlp_sf = torch.ops.trtllm.moe_swiglu_nvfp4_quantize(
+            mlp_hidden,
+            self.to_out.mlp_proj.input_scale,
+            tile_idx_to_mn_limit,
+            num_non_exiting_tiles,
+            tile_size,
+        )
+        mlp_out = self.to_out.mlp_proj(Fp4QuantizedTensor(mlp_fp4, mlp_sf))
+        if padded_tokens != num_tokens:
+            mlp_out = mlp_out[:num_tokens]
+        mlp_out = mlp_out.reshape(*shape[:-1], mlp_out.shape[-1])
+        return self._combine_split_projection(attn_out, mlp_out)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -433,6 +552,14 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         Returns:
             hidden_states [batch, seq, dim]
         """
+        if self._can_project_hidden_mlp_with_fp4out(hidden_states):
+            qkv = self.to_qkv_mlp_proj.qkv_proj(hidden_states)
+            q, k, v = self._apply_norm_rope(qkv, image_rotary_emb)
+            attn_out = self._attn_impl(q, k, v, timestep=timestep)
+            attn_out = attn_out.to(q.dtype)
+            mlp_out = self._project_hidden_mlp_with_fp4out(hidden_states)
+            return self._combine_split_projection(attn_out, mlp_out)
+
         # Fused QKV + MLP projection
         qkv, mlp_hidden = self.to_qkv_mlp_proj(hidden_states)
 
@@ -443,6 +570,9 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
         # Parallel MLP path (reshape to 2D for Triton kernel, then back)
         shape = mlp_hidden.shape
+        if self._can_project_mlp_out_from_fp4():
+            return self._project_split_output_with_fp4_mlp(attn_out, mlp_hidden)
+
         mlp_out = swiglu(mlp_hidden.reshape(-1, shape[-1])).reshape(*shape[:-1], -1)
 
         # Concatenate + project
