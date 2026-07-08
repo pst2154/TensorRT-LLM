@@ -243,6 +243,7 @@ def test_qwen_joint_attention_keeps_separate_qkv_path_unwrapped(visual_gen_mappi
     assert attention.qkv_mode == QKVMode.SEPARATE_QKV
     assert attention.attn.__class__.__name__ != not_wrapped_as
 
+
 class _FakeTokenBatch:
     def __init__(self, attention_mask):
         self.attention_mask = attention_mask
